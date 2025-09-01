@@ -1,105 +1,197 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
+import sqlite3
+import datetime
+import re
 import os
-import asyncio
 
-# -----------------------------
-# Configurazione base del bot
-# -----------------------------
+# ---------- Config Bot ----------
+TOKEN = os.environ.get('DISCORD_TOKEN')  # Metti il token nelle Shared Variables di Railway
 intents = discord.Intents.default()
-intents.message_content = True  # Serve per leggere contenuti dei messaggi (solo legale se nel server centrale)
-bot = commands.Bot(command_prefix='!', intents=intents)
+intents.message_content = True
+intents.members = True
 
-# Coda utenti da verificare
-user_queue = asyncio.Queue()
+bot = commands.Bot(command_prefix='/', intents=intents)
 
-# -----------------------------
-# CONFIGURAZIONE UTENTE
-# -----------------------------
-# Inserisci qui l'ID del canale del server centrale dove inviare i report
-REPORT_CHANNEL_ID = 1411860980862029934  
+# ---------- Database SQLite ----------
+conn = sqlite3.connect('fortgreely.db')
+c = conn.cursor()
 
-# Livelli di sospetto supportati
-LEVELS = ["Pulito", "Sospetto Medio", "Sospetto Alto", "Confermato"]
+# Tabella per messaggi dai server esterni
+c.execute('''
+CREATE TABLE IF NOT EXISTS messages (
+    message_id TEXT PRIMARY KEY,
+    discord_id TEXT,
+    username TEXT,
+    license TEXT,
+    reason TEXT,
+    duration TEXT,
+    staff TEXT,
+    server TEXT,
+    channel TEXT,
+    timestamp TEXT
+)
+''')
 
-# -----------------------------
-# EVENTI BASE
-# -----------------------------
-@bot.event
-async def on_ready():
-    print(f'{bot.user} è online!')
-    process_queue.start()  # Avvia il task per processare la coda automatica
+# Tabella per log FiveGuard
+c.execute('''
+CREATE TABLE IF NOT EXISTS fiveguard_logs (
+    log_id TEXT PRIMARY KEY,
+    discord_id TEXT,
+    name TEXT,
+    violation TEXT,
+    info TEXT,
+    steam TEXT,
+    license TEXT,
+    live TEXT,
+    xbox TEXT,
+    ip TEXT,
+    timestamp TEXT
+)
+''')
+conn.commit()
 
-# -----------------------------
-# FUNZIONI DI SUPPORTO
-# -----------------------------
-async def send_report(user_id, username, level, messages=None):
-    """Invia un report embed nel canale centrale"""
-    channel = bot.get_channel(REPORT_CHANNEL_ID)
-    if not channel:
-        print("Canale report non trovato")
-        return
+# ---------- Comandi ----------
 
-    embed = discord.Embed(title="Report Utente", color=0xff0000)
-    embed.add_field(name="Utente", value=username, inline=True)
-    embed.add_field(name="ID", value=str(user_id), inline=True)
-    embed.add_field(name="Livello", value=level, inline=True)
+@bot.command()
+async def ping(ctx):
+    await ctx.send("Pong!")
 
-    if messages:
-        embed.add_field(name="Messaggi rilevanti", value="\n".join(messages), inline=False)
+# -------- Paste blocco messaggi server esterni ----------
+@bot.command()
+async def paste_db(ctx, *, blocco):
+    timestamp = datetime.datetime.utcnow().isoformat()
+    lines = blocco.split('\n')
+    buffer = {}
+    count = 0
 
-    if level == "Confermato":
-        await channel.send("@everyone", embed=embed)
+    for line in lines:
+        line = line.strip()
+        if line.startswith("Player:"):
+            buffer['username'] = line.replace("Player:", "").strip()
+        elif line.startswith("Discord:"):
+            match = re.search(r'(\d{17,19})', line)
+            buffer['discord_id'] = match.group(1) if match else None
+        elif line.lower().startswith("license:"):
+            buffer['license'] = line.split(":", 1)[1].strip()
+        elif line.lower().startswith("motivazione:") or line.lower().startswith("motivo:"):
+            buffer['reason'] = line.split(":", 1)[1].strip()
+        elif line.lower().startswith("scadenza:") or line.lower().startswith("durata:"):
+            buffer['duration'] = line.split(":", 1)[1].strip()
+        elif line.lower().startswith("staff:"):
+            buffer['staff'] = line.split(":", 1)[1].strip()
+
+        # Inserisci nel DB se discord_id e username sono presenti
+        if 'discord_id' in buffer and 'username' in buffer:
+            message_id = f"{buffer['discord_id']}_{timestamp}_{count}"
+            c.execute('''
+            INSERT OR REPLACE INTO messages
+            (message_id, discord_id, username, license, reason, duration, staff, server, channel, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                message_id,
+                buffer.get('discord_id'),
+                buffer.get('username'),
+                buffer.get('license'),
+                buffer.get('reason'),
+                buffer.get('duration'),
+                buffer.get('staff'),
+                ctx.guild.name,
+                ctx.channel.name,
+                timestamp
+            ))
+            conn.commit()
+            buffer = {}
+            count += 1
+
+    await ctx.send(f"{count} messaggi aggiunti al database.")
+
+# -------- Paste blocco log FiveGuard ----------
+@bot.command()
+async def paste_fiveguard(ctx, *, blocco):
+    timestamp = datetime.datetime.utcnow().isoformat()
+    lines = blocco.split('\n')
+    buffer = {}
+    count = 0
+
+    for line in lines:
+        line = line.strip()
+        if line.startswith("Name"):
+            buffer['name'] = line.split(":",1)[1].strip()
+        elif line.startswith("Discord"):
+            match = re.search(r'(\d{17,19})', line)
+            buffer['discord_id'] = match.group(1) if match else None
+        elif line.startswith("Violation"):
+            buffer['violation'] = line.split(":",1)[1].strip()
+        elif line.startswith("Additional Info"):
+            buffer['info'] = line.split(":",1)[1].strip()
+        elif line.startswith("Steam"):
+            buffer['steam'] = line.split(":",1)[1].strip()
+        elif line.startswith("License"):
+            buffer['license'] = line.split(":",1)[1].strip()
+        elif line.startswith("Live"):
+            buffer['live'] = line.split(":",1)[1].strip()
+        elif line.startswith("Xbox"):
+            buffer['xbox'] = line.split(":",1)[1].strip()
+        elif line.startswith("IP Address"):
+            buffer['ip'] = line.split(":",1)[1].strip()
+
+        if 'discord_id' in buffer and buffer['discord_id']:
+            log_id = f"{buffer['discord_id']}_{timestamp}_{count}"
+            c.execute('''
+            INSERT OR REPLACE INTO fiveguard_logs
+            (log_id, discord_id, name, violation, info, steam, license, live, xbox, ip, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                log_id,
+                buffer.get('discord_id'),
+                buffer.get('name'),
+                buffer.get('violation'),
+                buffer.get('info'),
+                buffer.get('steam'),
+                buffer.get('license'),
+                buffer.get('live'),
+                buffer.get('xbox'),
+                buffer.get('ip'),
+                timestamp
+            ))
+            conn.commit()
+            buffer = {}
+            count += 1
+
+    await ctx.send(f"{count} log FiveGuard aggiunti al database.")
+
+# -------- Comando controlla ID ----------
+@bot.command()
+async def controlla(ctx, discord_id: str):
+    report = f"Report per <@{discord_id}> ({discord_id}):\n\n"
+
+    # Cerca messaggi esterni
+    c.execute("SELECT * FROM messages WHERE discord_id=?", (discord_id,))
+    rows = c.fetchall()
+    if rows:
+        for r in rows:
+            line = f"- {r[4]} | Staff: {r[6]} | Server: {r[7]} | Channel: {r[8]}"
+            report += line + "\n"
     else:
-        await channel.send(embed=embed)
+        report += "Nessun ban/warn registrato dai server esterni.\n"
 
-# -----------------------------
-# TASK PER CODA AUTOMATICA
-# -----------------------------
-@tasks.loop(seconds=10)
-async def process_queue():
-    """Processa utenti dalla coda automatica"""
-    while not user_queue.empty():
-        user = await user_queue.get()
-        await send_report(
-            user_id=user["id"],
-            username=user["username"],
-            level=user["level"],
-            messages=user.get("messages")
-        )
-        await asyncio.sleep(1)  # Pausa per non spam
+    # Cerca log FiveGuard
+    c.execute("SELECT * FROM fiveguard_logs WHERE discord_id=?", (discord_id,))
+    logs = c.fetchall()
+    if logs:
+        report += "\nFiveGuard FLAG RoyalRP:\n"
+        for log in logs:
+            report += f"- Violation: {log[3]}\n"
+            report += f"- Additional Info: {log[4]}\n"
+            report += f"- Steam: {log[5]}\n"
+            report += f"- License: {log[6]}\n"
+            report += f"- Live: {log[7]}\n"
+            report += f"- Xbox: {log[8]}\n"
+            report += f"- IP Address: {log[9]}\n"
+            report += "----------------------\n"
 
-# -----------------------------
-# COMANDI DEL BOT
-# -----------------------------
-@bot.command()
-async def controlla(ctx, user_id: int, username: str, level: str):
-    """
-    Verifica manuale di un utente.
-    Uso: /controlla <ID> <username> <Livello>
-    """
-    if level not in LEVELS:
-        await ctx.send(f"Livello non valido. Usa: {', '.join(LEVELS)}")
-        return
+    await ctx.send(report or "Nessun dato trovato.")
 
-    await send_report(user_id=user_id, username=username, level=level, messages=[])
-    await ctx.send(f"Report generato per {username} (ID: {user_id})")
-
-@bot.command()
-async def add_queue(ctx, user_id: int, username: str, level: str):
-    """
-    Aggiunge un utente alla coda automatica.
-    Uso: !add_queue <ID> <username> <Livello>
-    """
-    if level not in LEVELS:
-        await ctx.send(f"Livello non valido. Usa: {', '.join(LEVELS)}")
-        return
-
-    await user_queue.put({"id": user_id, "username": username, "level": level, "messages": []})
-    await ctx.send(f"Utente {username} aggiunto alla coda automatica")
-
-# -----------------------------
-# AVVIO BOT
-# -----------------------------
-TOKEN = os.environ['DISCORD_TOKEN']  # Usa variabile d'ambiente
+# ---------- Avvio Bot ----------
 bot.run(TOKEN)
